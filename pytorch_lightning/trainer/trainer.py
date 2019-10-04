@@ -69,6 +69,7 @@ class Trainer(TrainerIO):
                  check_val_every_n_epoch=1,
                  fast_dev_run=False,
                  accumulate_grad_batches=1,
+                 tbptt=False,
                  max_nb_epochs=1000,
                  min_nb_epochs=1,
                  train_percent_check=1.0,
@@ -100,6 +101,7 @@ class Trainer(TrainerIO):
         :param check_val_every_n_epoch: int. check val every n train epochs
         :param fast_dev_run: Bool. runs full iteration over everything to find bugs
         :param accumulate_grad_batches: int. Accumulates grads every k batches
+        :param tbptt: bool. BackPropagation Through Time
         :param max_nb_epochs: int.
         :param min_nb_epochs: int.
         :param train_percent_check: int. How much of train set to check
@@ -165,6 +167,9 @@ class Trainer(TrainerIO):
 
         # accumulated grads
         self.__configure_accumulated_gradients(accumulate_grad_batches)
+
+        # BackPropagation Through Time
+        self.tbptt = tbptt
 
         # allow int, string and gpu list
         self.data_parallel_device_ids = self.__parse_gpu_ids(gpus)
@@ -906,6 +911,11 @@ class Trainer(TrainerIO):
         # restore training and model before hpc call
         self.restore_weights(model)
 
+        if self.tbptt and not self.__is_function_implemented('tbptt_continue'):
+            raise ValueError(
+                'When using `tbptt`, model must implement the method `tbptt_continue(self, batch)`'
+            )
+
         # progress bar init
         if self.show_progress_bar:
             self.progress_bar = tqdm.tqdm(0, position=self.process_position)
@@ -1205,62 +1215,66 @@ class Trainer(TrainerIO):
         # call training_step once per optimizer
         for opt_idx, optimizer in enumerate(self.optimizers):
 
-            # forward pass
-            loss, model_specific_tqdm_metrics = self.__training_forward(batch, batch_nb, opt_idx)
+            once = True
+            while once or (self.tbptt and self.model.tbptt_continue(batch)):
+                once = False
 
-            # track metrics
-            self.__add_tqdm_metrics(model_specific_tqdm_metrics)
+                # forward pass
+                loss, model_specific_tqdm_metrics = self.__training_forward(batch, batch_nb, opt_idx)
 
-            # accumulate loss
-            # (if accumulate_grad_batches = 1 no effect)
-            loss = loss / self.accumulate_grad_batches
+                # track metrics
+                self.__add_tqdm_metrics(model_specific_tqdm_metrics)
 
-            # backward pass
-            if self.use_amp:
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-            else:
-                loss.backward()
+                # accumulate loss
+                # (if accumulate_grad_batches = 1 no effect)
+                loss = loss / self.accumulate_grad_batches
 
-            # insert after step hook
-            if self.__is_function_implemented('on_after_backward'):
-                model_ref = self.__get_model()
-                model_ref.on_after_backward()
+                # backward pass
+                if self.use_amp:
+                    with amp.scale_loss(loss, optimizer) as scaled_loss:
+                        scaled_loss.backward()
+                else:
+                    loss.backward()
 
-            # nan grads
-            if self.print_nan_grads:
-                self.__print_nan_grads()
+                # insert after step hook
+                if self.__is_function_implemented('on_after_backward'):
+                    model_ref = self.__get_model()
+                    model_ref.on_after_backward()
 
-            # track total loss for logging (avoid mem leaks)
-            self.batch_loss_value += loss.item()
+                # nan grads
+                if self.print_nan_grads:
+                    self.__print_nan_grads()
 
-            # gradient update with accumulated gradients
-            if (self.batch_nb + 1) % self.accumulate_grad_batches == 0:
+                # track total loss for logging (avoid mem leaks)
+                self.batch_loss_value += loss.item()
 
-                # track gradient norms when requested
-                if batch_nb % self.row_log_interval == 0:
-                    if self.track_grad_norm > 0:
-                        model = self.__get_model()
-                        grad_norm_dic = model.grad_norm(self.track_grad_norm)
+                # gradient update with accumulated gradients
+                if (self.batch_nb + 1) % self.accumulate_grad_batches == 0:
 
-                # clip gradients
-                self.__clip_gradients()
+                    # track gradient norms when requested
+                    if batch_nb % self.row_log_interval == 0:
+                        if self.track_grad_norm > 0:
+                            model = self.__get_model()
+                            grad_norm_dic = model.grad_norm(self.track_grad_norm)
 
-                # calls .step(), .zero_grad()
-                # override function to modify this behavior
-                model = self.__get_model()
-                model.optimizer_step(self.current_epoch, batch_nb, optimizer, opt_idx)
+                    # clip gradients
+                    self.__clip_gradients()
 
-                # calculate running loss for display
-                self.running_loss.append(self.batch_loss_value)
-                self.batch_loss_value = 0
-                self.avg_loss = np.mean(self.running_loss[-100:])
+                    # calls .step(), .zero_grad()
+                    # override function to modify this behavior
+                    model = self.__get_model()
+                    model.optimizer_step(self.current_epoch, batch_nb, optimizer, opt_idx)
 
-                # update progressbar
-                if self.show_progress_bar:
-                    # add model specific metrics
-                    tqdm_metrics = self.__training_tqdm_dict
-                    self.progress_bar.set_postfix(**tqdm_metrics)
+                    # calculate running loss for display
+                    self.running_loss.append(self.batch_loss_value)
+                    self.batch_loss_value = 0
+                    self.avg_loss = np.mean(self.running_loss[-100:])
+
+                    # update progressbar
+                    if self.show_progress_bar:
+                        # add model specific metrics
+                        tqdm_metrics = self.__training_tqdm_dict
+                        self.progress_bar.set_postfix(**tqdm_metrics)
 
         # activate batch end hook
         if self.__is_function_implemented('on_batch_end'):
