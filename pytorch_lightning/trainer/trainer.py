@@ -55,6 +55,37 @@ def reduce_distributed_output(output, nb_gpus):
     return output
 
 
+def default_optimizer_closure(trainer, batch, batch_nb, optimizer, opt_idx, all_log_metrics):
+    """
+    Wrap the forward step in a closure so second order methods work
+    """
+    # forward pass
+    output = trainer.__training_forward(batch, batch_nb, opt_idx)
+    closure_loss, progress_bar_metrics, log_metrics = output
+
+    # track progress bar metrics
+    trainer.__add_tqdm_metrics(progress_bar_metrics)
+    all_log_metrics.append(log_metrics)
+
+    # accumulate loss
+    # (if accumulate_grad_batches = 1 no effect)
+    closure_loss = closure_loss / trainer.accumulate_grad_batches
+
+    # backward pass
+    if trainer.use_amp:
+        with amp.scale_loss(closure_loss, optimizer) as scaled_loss:
+            scaled_loss.backward()
+    else:
+        closure_loss.backward()
+
+    # insert after step hook
+    if trainer.__is_function_implemented('on_after_backward'):
+        model_ref = trainer.__get_model()
+        model_ref.on_after_backward()
+
+    return closure_loss
+
+
 class Trainer(TrainerIO):
 
     def __init__(self,
@@ -163,6 +194,8 @@ class Trainer(TrainerIO):
         self.global_step = 0
         self.current_epoch = 0
         self.total_batches = 0
+
+        self.optimizer_closure = default_optimizer_closure
 
         # configure early stop callback
         # creates a default one if none passed in
@@ -1330,36 +1363,10 @@ class Trainer(TrainerIO):
         # call training_step once per optimizer
         for opt_idx, optimizer in enumerate(self.optimizers):
 
-            # wrap the forward step in a closure so second order methods work
-            def optimizer_closure():
-                # forward pass
-                output = self.__training_forward(batch, batch_nb, opt_idx)
-                closure_loss, progress_bar_metrics, log_metrics = output
-
-                # track progress bar metrics
-                self.__add_tqdm_metrics(progress_bar_metrics)
-                all_log_metrics.append(log_metrics)
-
-                # accumulate loss
-                # (if accumulate_grad_batches = 1 no effect)
-                closure_loss = closure_loss / self.accumulate_grad_batches
-
-                # backward pass
-                if self.use_amp:
-                    with amp.scale_loss(closure_loss, optimizer) as scaled_loss:
-                        scaled_loss.backward()
-                else:
-                    closure_loss.backward()
-
-                # insert after step hook
-                if self.__is_function_implemented('on_after_backward'):
-                    model_ref = self.__get_model()
-                    model_ref.on_after_backward()
-
-                return closure_loss
-
-            # calculate loss
-            loss = optimizer_closure()
+            # run forward and backwad path, calculate loss in closure
+            loss = self.optimizer_closure(
+                self, batch, batch_nb, optimizer, opt_idx, all_log_metrics
+            )
 
             # nan grads
             if self.print_nan_grads:
@@ -1384,7 +1391,7 @@ class Trainer(TrainerIO):
                 # override function to modify this behavior
                 model = self.__get_model()
                 model.optimizer_step(self.current_epoch, batch_nb,
-                                     optimizer, opt_idx, optimizer_closure)
+                                     optimizer, opt_idx, self.optimizer_closure)
 
                 # calculate running loss for display
                 self.running_loss.append(self.batch_loss_value)
